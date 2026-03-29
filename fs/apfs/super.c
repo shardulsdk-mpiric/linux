@@ -1786,6 +1786,7 @@ static int apfs_get_tree(struct fs_context *fc)
 			return error;
 		}
 		sb->s_flags |= SB_ACTIVE;
+		ctx->sbi = NULL; /* Now owned by sb->s_fs_info */
 	}
 
 	fc->root = dget(sb->s_root);
