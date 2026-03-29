@@ -1940,6 +1940,13 @@ L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
 
+APPLE FILE SYSTEM (APFS)
+M:	Ernesto A. Fernández <ernesto@corellium.com>
+L:	linux-fsdevel@vger.kernel.org
+S:	Maintained
+F:	Documentation/filesystems/apfs.rst
+F:	fs/apfs/
+
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
 S:	Odd fixes

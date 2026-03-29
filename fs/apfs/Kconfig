@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config APFS_FS
+	tristate "Apple File System (APFS) support"
+	depends on BLOCK
+	select ZLIB_INFLATE
+	help
+	  APFS is the default filesystem used by macOS 10.13 (High Sierra)
+	  and later, as well as iOS 10.3 and later.  It supports copy-on-write
+	  semantics, encryption, snapshots, and fast directory sizing.
+
+	  To compile this filesystem support as a module, choose M here; the
+	  module will be called apfs.
+
+	  If unsure, say N.
