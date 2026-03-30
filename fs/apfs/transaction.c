@@ -310,18 +310,26 @@ static void apfs_trans_commit_work(struct work_struct *work)
 	struct apfs_nx_transaction *trans = NULL;
 	int err;
 
-	trans = container_of(to_delayed_work(work), struct apfs_nx_transaction, t_work);
+	trans = container_of(to_delayed_work(work),
+			     struct apfs_nx_transaction, t_work);
 	nxi = container_of(trans, struct apfs_nxsb_info, nx_transaction);
 	sb = trans->t_work_sb;
 
 	/*
-	 * If sb is set then the transaction already started, there is no need
-	 * for apfs_transaction_start() here. It would be cleaner to call it
-	 * anyway (and check in there if sb is set), but maxops is a problem
-	 * because we don't need any space. I really need to rethink that stuff
-	 * (TODO).
+	 * Use trylock to avoid blocking the workqueue thread when
+	 * concurrent writers hold nx_big_sem.  If the semaphore is
+	 * contended, reschedule instead — the next writer to complete
+	 * apfs_transaction_commit() will either do a synchronous commit
+	 * (when apfs_transaction_need_commit() fires) or re-queue this
+	 * work.  Data safety is not affected because the write path
+	 * forces a synchronous commit once buffer or space thresholds
+	 * are exceeded.
 	 */
-	down_write(&nxi->nx_big_sem);
+	if (!down_write_trylock(&nxi->nx_big_sem)) {
+		mod_delayed_work(system_wq, &trans->t_work,
+				 msecs_to_jiffies(100));
+		return;
+	}
 	if (!sb || sb->s_flags & SB_RDONLY) {
 		/* The commit already took place, or there was an abort */
 		up_write(&nxi->nx_big_sem);
