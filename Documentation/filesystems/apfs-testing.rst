@@ -101,6 +101,54 @@ After unmounting the written image and remounting read-only:
 No warnings, no errors, no KASAN reports after the UAF fix.  Only
 expected informational messages about write-mode status.
 
+7. xfstests generic suite (partial, 2026-03-30)
+------------------------------------------------
+
+Ran ``./check -g auto`` against the generic test suite.  The run covered
+tests generic/001 through generic/346 before being aborted due to a hung
+test (see known bugs below).  Approximately 60+ tests passed, ~13 failed
+due to TEST_DIR read-only remount (not data-corruption), many skipped
+(fallocate, ACLs, reflink, dm-flakey not supported).
+
+Known Bugs
+==========
+
+1. Deadlock: nx_big_sem contention (generic/346)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Severity**: HIGH — causes unrecoverable system hang
+
+The APFS driver uses a single global rw_semaphore (``nx_big_sem``) for
+all container operations.  The periodic transaction commit worker
+(``apfs_trans_commit_work``) needs write access to this semaphore, but
+when a userspace write path already holds it and generates enough I/O to
+require a commit, the commit worker blocks indefinitely.  Neither the
+writer nor the worker can make progress.
+
+This was triggered by generic/346 (holetest — concurrent writes with
+holes) and caused an unrecoverable hang requiring a hard reboot.
+``kill -9`` did not help because the hung task was in uninterruptible
+sleep waiting for the semaphore.
+
+The out-of-tree module author acknowledged this as a known limitation.
+A fix requires redesigning the locking to use finer-grained locks or
+allowing synchronous commits from within the write path when the
+deferred worker cannot acquire the semaphore.
+
+2. TEST_DIR read-only remount
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Severity**: LOW — test infrastructure issue, not data corruption
+
+The APFS driver requires an explicit ``readwrite`` mount option to
+enable writes (safety gate inherited from the out-of-tree module).
+When xfstests internally remounts TEST_DEV, it does not always pass
+``MOUNT_OPTIONS``, causing the remount to default to read-only.  This
+causes ~13 test failures that operate on TEST_DIR.
+
+Fix options: change APFS to default to read-write (matching kernel
+convention), or adapt xfstests mount handling.
+
 What Has NOT Been Tested Yet
 ============================
 
