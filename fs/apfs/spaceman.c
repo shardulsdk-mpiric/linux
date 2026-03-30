@@ -794,7 +794,8 @@ int apfs_read_spaceman(struct super_block *sb)
 	return 0;
 
 fail:
-	spaceman->sm_raw = NULL;
+	if (spaceman)
+		spaceman->sm_raw = NULL;
 	return err;
 }
 
