@@ -16,14 +16,19 @@
 # Usage (add MPTCP_LIB_IP_MPTCP=1 in front if pm_nl_ctl does not work for you):
 #   SCENARIO=suite                              ./mptcp_sched_penalise.sh
 #   SCENARIO=unbounded                          ./mptcp_sched_penalise.sh
-#   SCENARIO=rwnd    RCVBUF=262144              ./mptcp_sched_penalise.sh
-#   SCENARIO=sndbuf  SNDBUF=65536               ./mptcp_sched_penalise.sh
-#   SCENARIO=both    RCVBUF=262144 SNDBUF=65536 ./mptcp_sched_penalise.sh
+#   SCENARIO=rwnd     RCVBUF=262144             ./mptcp_sched_penalise.sh
+#   SCENARIO=sndbuf   SNDBUF=65536              ./mptcp_sched_penalise.sh
+#   SCENARIO=both     RCVBUF=262144 SNDBUF=65536 ./mptcp_sched_penalise.sh
+#   SCENARIO=bloat    [BLOAT_LIMIT=1000]        ./mptcp_sched_penalise.sh
+#   SCENARIO=sndbuf_hi SNDBUF=262144 RCVBUF=131072 ./mptcp_sched_penalise.sh
 # RCVBUF/SNDBUF pin SO_RCVBUF/SO_SNDBUF; SLOW_DELAY=<ms> overrides the slow
-# path's extra delay.
+# path's extra delay; BLOAT_LIMIT sets the bloated path's netem queue length.
+# SOLO=1 (any scenario) runs the fast path only, no slow subflow -- the
+# "without the slow subflow" reference to compare a 2-path run against.
 #
 # The ">>>" line reports Halved and PenalCand (both need the DO-NOT-MERGE
-# counters patch; read 0 without it) and OFO (MPTcpExtOFOQueue, any kernel).
+# counters patch; read 0 without it), OFO (MPTcpExtOFOQueue, any kernel), and
+# RTTms[min/max/avg] of the connector subflows (max >> min = one path bloated).
 # For the rwnd / sndbuf / both scenarios the simult_flows pass/fail time bound
 # is not meaningful (it assumes both paths fully used): read the printed
 # runtime and OFO, not OK/FAIL.
@@ -48,6 +53,20 @@ cout=""
 capout=""
 capprefix=""
 size=0
+rtts=""
+
+# Sample the connector-side subflow RTTs (srtt from `ss -ti`) once per interval
+# into a file, so a transfer's RTT range can be read afterwards. A slow path
+# that bufferbloats shows up as max >> min (its queue fills, srtt climbs).
+_rtt_sampler()
+{
+	local ns=$1 out=$2
+	while :; do
+		ip netns exec "$ns" ss -tin state established 2>/dev/null \
+			| grep -oE 'rtt:[0-9.]+' | cut -d: -f2 >> "$out"
+		sleep 0.5
+	done
+}
 
 usage() {
 	echo "Usage: $0 [ -b ] [ -c ] [ -d ] [ -i]"
@@ -63,7 +82,7 @@ cleanup()
 {
 	rm -f "$cout" "$sout"
 	rm -f "$large" "$small"
-	rm -f "$capout"
+	rm -f "$capout" "$rtts"
 
 	mptcp_lib_ns_exit "${ns1}" "${ns2}" "${ns3}"
 }
@@ -84,6 +103,7 @@ setup()
 	sout=$(mktemp)
 	cout=$(mktemp)
 	capout=$(mktemp)
+	rtts=$(mktemp)
 	size=$((2 * 2048 * 4096))
 
 	dd if=/dev/zero of=$small bs=4096 count=20 >/dev/null 2>&1
@@ -114,8 +134,13 @@ setup()
 	ip -net "$ns1" route add default via 10.0.2.2 metric 101
 	ip -net "$ns1" route add default via dead:beef:2::2 metric 101
 
-	mptcp_lib_pm_nl_set_limits "${ns1}" 1 1
-	mptcp_lib_pm_nl_add_endpoint "${ns1}" 10.0.2.1 dev ns1eth2 flags subflow
+	# SOLO=1 runs the fast path only (no slow subflow), for the "how does it do
+	# without the slow subflow at all" reference Matt asked for. Compare a SOLO
+	# run against the normal 2-path run of the same scenario.
+	if [ "${SOLO:-0}" = 0 ]; then
+		mptcp_lib_pm_nl_set_limits "${ns1}" 1 1
+		mptcp_lib_pm_nl_add_endpoint "${ns1}" 10.0.2.1 dev ns1eth2 flags subflow
+	fi
 
 	ip -net "$ns2" addr add 10.0.1.2/24 dev ns2eth1
 	ip -net "$ns2" addr add dead:beef:1::2/64 dev ns2eth1 nodad
@@ -197,6 +222,10 @@ do_transfer()
 			10.0.3.3 < "$cin" > "$cout" &
 	local cpid=$!
 
+	:> "$rtts"
+	_rtt_sampler "${ns1}" "$rtts" &
+	local rtt_pid=$!
+
 	mptcp_lib_wait_timeout "${timeout_test}" "${ns3}" "${ns1}" "${port}" \
 		"${cpid}" "${spid}" &
 	local timeout_pid=$!
@@ -218,6 +247,14 @@ do_transfer()
 		kill ${cappid_connector}
 	fi
 
+	kill "$rtt_pid" 2>/dev/null
+	wait "$rtt_pid" 2>/dev/null
+	# min/max/avg srtt (ms) seen on the connector's subflows during the transfer.
+	# max >> min = one path bufferbloated (its queue filled and srtt climbed).
+	local rtt_stat
+	rtt_stat=$(awk 'NR==1{mn=mx=$1} {s+=$1; n++; if($1<mn)mn=$1; if($1>mx)mx=$1}
+		END{if(n)printf "min=%.1f max=%.1f avg=%.1f (%d)", mn, mx, s/n, n; else printf "n/a"}' "$rtts")
+
 	mptcp_lib_nstat_get "${ns3}"
 	mptcp_lib_nstat_get "${ns1}"
 	# Per-run instrumentation. Halved = times a subflow cwnd was halved,
@@ -226,7 +263,7 @@ do_transfer()
 	# out-of-order data queued at the receiver; lower means less head-of-line
 	# blocking. All read on any kernel, so baseline vs patched is comparable.
 	gc() { mptcp_lib_get_counter "$1" "$2" 2>/dev/null || echo 0; }
-	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalized)/ns3=$(gc ${ns3} MPTcpExtCwndPenalized)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)"
+	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalized)/ns3=$(gc ${ns3} MPTcpExtCwndPenalized)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)  RTTms[${rtt_stat}]"
 
 	cmp $sin $cout > /dev/null 2>&1
 	local cmps=$?
@@ -381,8 +418,33 @@ both)
 	: "${SNDBUF:?both scenario needs SNDBUF=<bytes>, e.g. 65536}"
 	run_test 10 3 0 ${SLOW_DELAY:-50} 100 100 "send-buffer + receive-window limited, slow +${SLOW_DELAY:-50}ms, SO_RCVBUF=${RCVBUF} SO_SNDBUF=${SNDBUF}"
 	;;
+bloat)
+	# One path bufferbloated: a netem queue (limit2) on the slow (3mbit) path
+	# fills under load so its srtt climbs. This is the canonical #345 target
+	# ("usable but poorly-performing" path). Read OFO + the RTTms range, and
+	# compare a normal run against SOLO=1 (fast path alone) to see whether the
+	# bloated path drags the transfer below single-path (Matt's floor bar).
+	#
+	# Queue SIZE matters (Matt: "the limits influence the bufferbloat a lot").
+	# The 3mbit path drains ~250 pkt/s, so limit2 packets ~= limit2/250 s of
+	# standing latency: 50 -> ~200ms, 100 -> ~400ms, 200 -> ~800ms. Keep it in
+	# the few-hundred-ms range: deep enough to bloat, shallow enough to stay
+	# STABLE (a multi-second queue triggers RTO storms and the completion time
+	# swings wildly on the baseline too, which swamps the signal). Sweep
+	# BLOAT_LIMIT and keep the value where the SOLO/baseline variance stays low.
+	run_test 10 3 0 0  30 ${BLOAT_LIMIT:-100} "bufferbloat on the slow path (limit ${BLOAT_LIMIT:-100})"
+	;;
+sndbuf_hi)
+	# Matt/Sashiko case: send buffer LARGER than the receive window, but
+	# congestion-limited. The app queues past the peer window (write_seq >
+	# wnd_end) even though the paths, not the receiver, are the bottleneck ->
+	# does patch 2's guard wrongly suppress the penalty? Set SNDBUF > RCVBUF.
+	: "${SNDBUF:?sndbuf_hi needs SNDBUF=<bytes> higher than RCVBUF, e.g. 262144}"
+	: "${RCVBUF:?sndbuf_hi needs RCVBUF=<bytes> lower than SNDBUF, e.g. 131072}"
+	run_test 10 3 0 ${SLOW_DELAY:-30} 100 100 "sndbuf>rcvbuf, congestion-limited, SO_SNDBUF=${SNDBUF} SO_RCVBUF=${RCVBUF}"
+	;;
 *)
-	echo "unknown SCENARIO='${SCENARIO}' (use: suite | unbounded | rwnd | sndbuf | both)" >&2
+	echo "unknown SCENARIO='${SCENARIO}' (use: suite | unbounded | rwnd | sndbuf | both | bloat | sndbuf_hi)" >&2
 	exit 1
 	;;
 esac
