@@ -104,7 +104,11 @@ setup()
 	cout=$(mktemp)
 	capout=$(mktemp)
 	rtts=$(mktemp)
-	size=$((2 * 2048 * 4096))
+	# SIZE_MULT scales the transfer (and thus the run duration); the time bound
+	# below is derived from size, so it scales automatically. A longer run
+	# (SIZE_MULT=3-5) spends more time in steady-state bufferbloat, less in
+	# slow-start/queue-fill ramp-up, giving cleaner OFO/latency signal.
+	size=$((2 * 2048 * 4096 * ${SIZE_MULT:-1}))
 
 	dd if=/dev/zero of=$small bs=4096 count=20 >/dev/null 2>&1
 	dd if=/dev/zero of=$large bs=4096 count=$((size / 4096)) >/dev/null 2>&1
@@ -263,7 +267,16 @@ do_transfer()
 	# out-of-order data queued at the receiver; lower means less head-of-line
 	# blocking. All read on any kernel, so baseline vs patched is comparable.
 	gc() { mptcp_lib_get_counter "$1" "$2" 2>/dev/null || echo 0; }
-	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalized)/ns3=$(gc ${ns3} MPTcpExtCwndPenalized)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)  RTTms[${rtt_stat}]"
+	# Per-path egress bytes from the four netem qdiscs (fast = *eth1, slow =
+	# *eth2, summed over both sender sides). Lets us tell whether the penalty
+	# shifts the routing split OFF the slow path (which would cut OFO count) or
+	# only throttles its queue depth (cuts latency, not OFO count -> #332 is
+	# what moves data off the slow path).
+	qb() { local b; b=$(tc -s -n "$1" qdisc show dev "$2" 2>/dev/null | grep -oE 'Sent [0-9]+' | head -1 | grep -oE '[0-9]+'); echo "${b:-0}"; }
+	local fast_b=$(( $(qb "${ns1}" ns1eth1) + $(qb "${ns2}" ns2eth1) ))
+	local slow_b=$(( $(qb "${ns1}" ns1eth2) + $(qb "${ns2}" ns2eth2) ))
+	local slow_pct=0; [ $((fast_b + slow_b)) -gt 0 ] && slow_pct=$(( slow_b * 100 / (fast_b + slow_b) ))
+	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalized)/ns3=$(gc ${ns3} MPTcpExtCwndPenalized)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)  Bytes[fast=${fast_b} slow=${slow_b} slow=${slow_pct}%]  RTTms[${rtt_stat}]"
 
 	cmp $sin $cout > /dev/null 2>&1
 	local cmps=$?
