@@ -8,30 +8,48 @@
 
 # MPTCP scheduler "penalise" test (issue #345). Drive data over an asymmetric
 # two-path setup and observe the "penalise a slow subflow" scheduler behaviour.
-# A variant of simult_flows.sh with the same netem topology, plus a small matrix
-# of buffer-constraint scenarios. Per run it prints how often the scheduler
-# halved a subflow cwnd and how much out-of-order data the receiver queued.
-# Meant to be run on a baseline kernel and a patched one and compared.
+# A variant of simult_flows.sh with the same netem topology, plus a matrix of
+# buffer-constraint / bufferbloat scenarios. Meant to be run on a baseline
+# kernel and on a patched one, and the two compared.
 #
-# Usage (add MPTCP_LIB_IP_MPTCP=1 in front if pm_nl_ctl does not work for you):
-#   SCENARIO=suite                              ./mptcp_sched_penalise.sh
-#   SCENARIO=unbounded                          ./mptcp_sched_penalise.sh
-#   SCENARIO=rwnd     RCVBUF=262144             ./mptcp_sched_penalise.sh
-#   SCENARIO=sndbuf   SNDBUF=65536              ./mptcp_sched_penalise.sh
-#   SCENARIO=both     RCVBUF=262144 SNDBUF=65536 ./mptcp_sched_penalise.sh
-#   SCENARIO=bloat    [BLOAT_LIMIT=1000]        ./mptcp_sched_penalise.sh
-#   SCENARIO=sndbuf_hi SNDBUF=262144 RCVBUF=131072 ./mptcp_sched_penalise.sh
-# RCVBUF/SNDBUF pin SO_RCVBUF/SO_SNDBUF; SLOW_DELAY=<ms> overrides the slow
-# path's extra delay; BLOAT_LIMIT sets the bloated path's netem queue length.
-# SOLO=1 (any scenario) runs the fast path only, no slow subflow -- the
-# "without the slow subflow" reference to compare a 2-path run against.
+# --- run a single scenario -------------------------------------------------
+# (prefix MPTCP_LIB_IP_MPTCP=1 if pm_nl_ctl does not work in your setup)
+#   SCENARIO=suite                                   ./mptcp_sched_penalise.sh
+#   SCENARIO=sndbuf    SNDBUF=65536                  ./mptcp_sched_penalise.sh
+#   SCENARIO=rwnd      RCVBUF=262144                 ./mptcp_sched_penalise.sh
+#   SCENARIO=both      RCVBUF=262144 SNDBUF=65536    ./mptcp_sched_penalise.sh
+#   SCENARIO=sndbuf_hi SNDBUF=262144 RCVBUF=131072   ./mptcp_sched_penalise.sh
+#   SCENARIO=unbounded [SLOW_DELAY=50]               ./mptcp_sched_penalise.sh
+#   SCENARIO=bloat     [BLOAT_LIMIT=100]             ./mptcp_sched_penalise.sh
 #
-# The ">>>" line reports Halved and PenalCand (both need the DO-NOT-MERGE
-# counters patch; read 0 without it), OFO (MPTcpExtOFOQueue, any kernel), and
-# RTTms[min/max/avg] of the connector subflows (max >> min = one path bloated).
-# For the rwnd / sndbuf / both scenarios the simult_flows pass/fail time bound
-# is not meaningful (it assumes both paths fully used): read the printed
-# runtime and OFO, not OK/FAIL.
+# Knobs:
+#   RCVBUF / SNDBUF  pin SO_RCVBUF / SO_SNDBUF.
+#   SLOW_DELAY=<ms>  extra delay on the slow path (unbounded scenario).
+#   BLOAT_LIMIT=<n>  slow-path netem queue in packets (bloat scenario). The
+#                    3mbit path drains ~250 pkt/s, so n packets ~= n/250 s of
+#                    standing latency; keep it a few hundred ms (n ~50-200),
+#                    a multi-second queue is RTO chaos. Default 100 (~330ms).
+#   SIZE_MULT=<k>    scale the transfer size/duration (default 1, ~12s). A
+#                    longer run (k=3-5) sits in steady-state bufferbloat with
+#                    less slow-start ramp-up, for cleaner OFO/latency signal.
+#   SOLO=1           run the fast path ALONE, no slow subflow. The "without
+#                    the slow subflow" reference for the floor bar: a
+#                    penalised 2-path run must be no worse than SOLO.
+#
+# --- run the whole base-vs-patch matrix ------------------------------------
+#   REPEAT=3 ./run_matrix.sh          # every group in runs.conf, tabulated
+# Run the SAME command on the baseline and the patched kernel, and diff the
+# tables. runs.conf lists the scenario groups and sweeps (BLOAT_LIMIT,
+# SLOW_DELAY, RCVBUF, ...).
+#
+# The ">>>" line per run reports: Halved / PenalCand (MPTcpExt CwndPenalized /
+# PenalCandidate; read 0 on a kernel without them), OFO (MPTcpExtOFOQueue, the
+# receiver out-of-order volume = a head-of-line-blocking indicator), Bytes[fast
+# / slow / slow%] (per-path egress from the netem qdiscs = the routing split),
+# and RTTms[min/max/avg] of the connector subflows (max >> min = one path
+# bloated). For the rwnd / sndbuf / both scenarios the simult_flows pass/fail
+# time bound is not meaningful (it assumes both paths fully used): read the
+# runtime, OFO, Bytes and RTT, and compare against SOLO, not OK/FAIL.
 
 . "$(dirname "${0}")/mptcp_lib.sh"
 
