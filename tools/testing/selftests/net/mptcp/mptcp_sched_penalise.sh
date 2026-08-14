@@ -42,7 +42,7 @@
 # tables. runs.conf lists the scenario groups and sweeps (BLOAT_LIMIT,
 # SLOW_DELAY, RCVBUF, ...).
 #
-# The ">>>" line per run reports: Halved / PenalCand (MPTcpExt CwndPenalized /
+# The ">>>" line per run reports: Halved / PenalCand (MPTcpExt CwndPenalised /
 # PenalCandidate; read 0 on a kernel without them), OFO (MPTcpExtOFOQueue, the
 # receiver out-of-order volume = a head-of-line-blocking indicator), Bytes[fast
 # / slow / slow%] (per-path egress from the netem qdiscs = the routing split),
@@ -80,8 +80,17 @@ _rtt_sampler()
 {
 	local ns=$1 out=$2
 	while :; do
-		ip netns exec "$ns" ss -tin state established 2>/dev/null \
-			| grep -oE 'rtt:[0-9.]+' | cut -d: -f2 >> "$out"
+		ip netns exec "$ns" ss -tin state established 2>/dev/null | awk '
+			/rtt:/ {
+				r=""; c=""; s="";
+				for (i = 1; i <= NF; i++) {
+					if ($i ~ /^rtt:/)      { split($i, a, "[:/]"); r = a[2] }
+					if ($i ~ /^cwnd:/)     { split($i, a, ":");     c = a[2] }
+					if ($i ~ /^ssthresh:/) { split($i, a, ":");     s = a[2] }
+				}
+				# one line per subflow: rtt(ms) cwnd ssthresh
+				if (r != "") print r, (c == "" ? 0 : c), (s == "" ? 0 : s)
+			}' >> "$out"
 		sleep 0.5
 	done
 }
@@ -276,6 +285,15 @@ do_transfer()
 	local rtt_stat
 	rtt_stat=$(awk 'NR==1{mn=mx=$1} {s+=$1; n++; if($1<mn)mn=$1; if($1>mx)mx=$1}
 		END{if(n)printf "min=%.1f max=%.1f avg=%.1f (%d)", mn, mx, s/n, n; else printf "n/a"}' "$rtts")
+	# Slow-subflow cwnd trajectory (samples with rtt > 5ms = the slow path; the
+	# fast path sits ~1ms). Tests the review's High: does the penalty drive the
+	# slow subflow's cwnd to the floor of 2 and pin it there? floor% = fraction
+	# of slow-path samples at cwnd <= 2; ssth_min = lowest ssthresh seen.
+	local cwnd_stat
+	cwnd_stat=$(awk '$1>5 { n++; if(n==1||$2<cmn)cmn=$2; csum+=$2; if($2<=2)fl++;
+			  if(n==1||$3<smn)smn=$3 }
+		END{ if(n) printf "SlowCwnd[min=%d avg=%.0f floor%%=%d ssth_min=%d]", cmn, csum/n, fl*100/n, smn;
+		     else printf "SlowCwnd[n/a]" }' "$rtts")
 
 	mptcp_lib_nstat_get "${ns3}"
 	mptcp_lib_nstat_get "${ns1}"
@@ -294,7 +312,7 @@ do_transfer()
 	local fast_b=$(( $(qb "${ns1}" ns1eth1) + $(qb "${ns2}" ns2eth1) ))
 	local slow_b=$(( $(qb "${ns1}" ns1eth2) + $(qb "${ns2}" ns2eth2) ))
 	local slow_pct=0; [ $((fast_b + slow_b)) -gt 0 ] && slow_pct=$(( slow_b * 100 / (fast_b + slow_b) ))
-	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalized)/ns3=$(gc ${ns3} MPTcpExtCwndPenalized)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)  Bytes[fast=${fast_b} slow=${slow_b} slow=${slow_pct}%]  RTTms[${rtt_stat}]"
+	echo "   >>> PenalCand ns1=$(gc ${ns1} MPTcpExtPenalCandidate)/ns3=$(gc ${ns3} MPTcpExtPenalCandidate)  Halved ns1=$(gc ${ns1} MPTcpExtCwndPenalised)/ns3=$(gc ${ns3} MPTcpExtCwndPenalised)  OFO ns1=$(gc ${ns1} MPTcpExtOFOQueue)/ns3=$(gc ${ns3} MPTcpExtOFOQueue)  Bytes[fast=${fast_b} slow=${slow_b} slow=${slow_pct}%]  RTTms[${rtt_stat}]  ${cwnd_stat}"
 
 	cmp $sin $cout > /dev/null 2>&1
 	local cmps=$?
@@ -344,10 +362,16 @@ run_test()
 
 	# keep the queued pkts number low, or the RTT estimator will see
 	# increasing latency over time.
-	tc -n $ns1 qdisc add dev ns1eth1 root netem rate ${rate1}mbit $delay1 limit ${limit1}
-	tc -n $ns1 qdisc add dev ns1eth2 root netem rate ${rate2}mbit $delay2 limit ${limit2}
-	tc -n $ns2 qdisc add dev ns2eth1 root netem rate ${rate1}mbit $delay1 limit ${limit1}
-	tc -n $ns2 qdisc add dev ns2eth2 root netem rate ${rate2}mbit $delay2 limit ${limit2}
+	# NORATE=1 drops the netem rate cap, leaving delay + queue only, so the
+	# path rate is governed by cwnd (not pinned by netem). This exposes the
+	# review's self-reinforcing loop: with the rate capped, avg_pacing_rate
+	# tracks the netem rate rather than cwnd, which can mask a cwnd collapse.
+	local nr1="rate ${rate1}mbit" nr2="rate ${rate2}mbit"
+	[ -n "${NORATE:-}" ] && { nr1=""; nr2=""; }
+	tc -n $ns1 qdisc add dev ns1eth1 root netem $nr1 $delay1 limit ${limit1}
+	tc -n $ns1 qdisc add dev ns1eth2 root netem $nr2 $delay2 limit ${limit2}
+	tc -n $ns2 qdisc add dev ns2eth1 root netem $nr1 $delay1 limit ${limit1}
+	tc -n $ns2 qdisc add dev ns2eth2 root netem $nr2 $delay2 limit ${limit2}
 
 	# time is measured in ms, account for transfer size, aggregated link speed
 	# and header overhead (10%)
@@ -426,7 +450,7 @@ unbounded)
 	# Autotuned buffers (neither SO_SNDBUF nor SO_RCVBUF pinned), slow path with
 	# extra delay: neither send-buffer- nor receive-window-limited. Compare OFO
 	# patched vs baseline.
-	run_test 10 3 0 ${SLOW_DELAY:-30} 100 100 "autotuned, slow +${SLOW_DELAY:-30}ms"
+	run_test 10 3 0 ${SLOW_DELAY:-30} ${LIMIT:-100} ${LIMIT:-100} "autotuned, slow +${SLOW_DELAY:-30}ms"
 	;;
 rwnd)
 	# Receive-window-limited: small SO_RCVBUF on the receiver (set RCVBUF=<bytes>,
