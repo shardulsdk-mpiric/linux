@@ -35,6 +35,7 @@ SUMMARY="$OUTDIR/summary.txt"
 
 {
 	echo "KERNEL $KREL"
+	echo "CC ${CC:-cubic}   (pinned per-namespace by the harness)"
 	echo "config $CONF   REPEAT $REPEAT   $(date)"
 	printf '%-20s %-3s %-3s %-10s %-7s %-7s %-9s %s\n' \
 		label run sub runtime_ms Halved OFO RTTmax result

@@ -144,6 +144,22 @@ setup()
 
 	mptcp_lib_ns_init ns1 ns2 ns3
 
+	# Pin the congestion control in every namespace and report it. Without
+	# this the run silently inherits the kernel build default, which is not
+	# recorded anywhere, so numbers cannot be compared across kernels or
+	# quoted with any confidence. Override with CC=<name>.
+	CC="${CC:-cubic}"
+	for _ns in "$ns1" "$ns2" "$ns3"; do
+		if ! ip netns exec "$_ns" sysctl -q net.ipv4.tcp_congestion_control="$CC" 2>/dev/null; then
+			echo "ERROR: cannot set congestion control '$CC' in $_ns." >&2
+			echo "       Is CONFIG_TCP_CONG_${CC^^} built in? Available:" >&2
+			ip netns exec "$_ns" sysctl -n net.ipv4.tcp_available_congestion_control >&2
+			exit 1
+		fi
+	done
+	CC_ACTUAL="$(ip netns exec "$ns1" sysctl -n net.ipv4.tcp_congestion_control)"
+	echo ">>> congestion control: ${CC_ACTUAL}"
+
 	if $capture; then
 		capprefix="simult_flows-${ns1:4}"
 		mptcp_lib_pr_info "pcap will have this prefix: ${capprefix}-"
