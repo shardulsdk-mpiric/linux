@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 
 #define BIND_PORT  21001
 #define PEER1_PORT 20001
@@ -91,6 +92,52 @@ static int run6(int do_bind)
 	return 0;
 }
 
+/* Defect 2: after connect(AF_UNSPEC) the entry is left behind, and
+ * because the same call clears sk_bound_dev_if, an unprivileged
+ * SO_BINDTODEVICE is then accepted and calls ->rehash() unconditionally.
+ * That relocates the stale entry to the zero-peer bucket instead of
+ * removing it.
+ */
+static int run_btd(void)
+{
+	struct sockaddr_in me = mk("127.0.0.1", BIND_PORT + 2);
+	struct sockaddr_in p1 = mk("127.0.0.1", PEER1_PORT);
+	struct sockaddr unspec;
+	int fd;
+
+	memset(&unspec, 0, sizeof(unspec));
+	unspec.sa_family = AF_UNSPEC;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		perror("socket");
+		return 1;
+	}
+	if (bind(fd, (struct sockaddr *)&me, sizeof(me)) < 0) {
+		perror("bind");
+		close(fd);
+		return 1;
+	}
+
+	mark("MARK-connect1");
+	if (connect(fd, (struct sockaddr *)&p1, sizeof(p1)) < 0)
+		perror("connect1");
+
+	mark("MARK-disconnect");
+	if (connect(fd, &unspec, sizeof(unspec)) < 0)
+		perror("disconnect");
+
+	mark("MARK-bindtodevice");
+	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) < 0)
+		printf("SO_BINDTODEVICE failed: %s\n", strerror(errno));
+	else
+		printf("SO_BINDTODEVICE accepted (uid %d)\n", (int)getuid());
+
+	mark("MARK-done");
+	close(fd);
+	return 0;
+}
+
 static int run(int do_bind)
 {
 	struct sockaddr_in me  = mk("127.0.0.1", BIND_PORT);
@@ -134,6 +181,13 @@ static int run(int do_bind)
 int main(int argc, char **argv)
 {
 	int do_bind = (argc > 1 && !strncmp(argv[1], "bound", 5));
+
+	if (argc > 1 && !strcmp(argv[1], "btd")) {
+		mfd = open("/sys/kernel/tracing/trace_marker", O_WRONLY);
+		if (mfd < 0)
+			mfd = open("/sys/kernel/debug/tracing/trace_marker", O_WRONLY);
+		return run_btd();
+	}
 
 	if (argc > 1 && strstr(argv[1], "6")) {
 		mfd = open("/sys/kernel/tracing/trace_marker", O_WRONLY);
